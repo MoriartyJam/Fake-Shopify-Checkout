@@ -65,6 +65,7 @@ API_VERSION = os.getenv('API_VERSION', '2026-01')
 PORT = int(os.getenv('PORT', 5000))
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN", "")
 TOKEN_DB_PATH = os.getenv("TOKEN_DB_PATH", "shop_tokens.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY", "")
 ENCRYPTED_TOKEN_PREFIX = "enc:"
 
@@ -78,7 +79,14 @@ else:
     logger.warning("⚠️ TOKEN_ENCRYPTION_KEY не задан. Токены в БД не будут шифроваться.")
 
 
+def use_postgres():
+    return DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://")
+
+
 def get_db_connection():
+    if use_postgres():
+        import psycopg2
+        return psycopg2.connect(DATABASE_URL)
     conn = sqlite3.connect(TOKEN_DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -86,16 +94,29 @@ def get_db_connection():
 
 def init_token_db():
     with get_db_connection() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS shop_tokens (
-                shop_domain TEXT PRIMARY KEY,
-                access_token TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        if use_postgres():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS shop_tokens (
+                        shop_domain TEXT PRIMARY KEY,
+                        access_token TEXT NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+            conn.commit()
+        else:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS shop_tokens (
+                    shop_domain TEXT PRIMARY KEY,
+                    access_token TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-            """
-        )
-        conn.commit()
+            conn.commit()
 
 
 def encrypt_token(access_token):
@@ -122,6 +143,14 @@ def decrypt_token(stored_token):
 
 def get_shop_token(shop_domain):
     with get_db_connection() as conn:
+        if use_postgres():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT access_token FROM shop_tokens WHERE shop_domain = %s",
+                    (shop_domain,)
+                )
+                row = cur.fetchone()
+                return decrypt_token(row[0]) if row else None
         row = conn.execute(
             "SELECT access_token FROM shop_tokens WHERE shop_domain = ?",
             (shop_domain,)
@@ -132,30 +161,55 @@ def get_shop_token(shop_domain):
 def save_shop_token(shop_domain, access_token):
     token_to_store = encrypt_token(access_token)
     with get_db_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO shop_tokens (shop_domain, access_token, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(shop_domain) DO UPDATE SET
-                access_token = excluded.access_token,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (shop_domain, token_to_store)
-        )
+        if use_postgres():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO shop_tokens (shop_domain, access_token, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT(shop_domain) DO UPDATE SET
+                        access_token = EXCLUDED.access_token,
+                        updated_at = NOW()
+                    """,
+                    (shop_domain, token_to_store)
+                )
+        else:
+            conn.execute(
+                """
+                INSERT INTO shop_tokens (shop_domain, access_token, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(shop_domain) DO UPDATE SET
+                    access_token = excluded.access_token,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (shop_domain, token_to_store)
+            )
         conn.commit()
 
 
 def delete_shop_token(shop_domain):
     with get_db_connection() as conn:
-        conn.execute(
-            "DELETE FROM shop_tokens WHERE shop_domain = ?",
-            (shop_domain,)
-        )
+        if use_postgres():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM shop_tokens WHERE shop_domain = %s",
+                    (shop_domain,)
+                )
+        else:
+            conn.execute(
+                "DELETE FROM shop_tokens WHERE shop_domain = ?",
+                (shop_domain,)
+            )
         conn.commit()
 
 
 def list_installed_shops():
     with get_db_connection() as conn:
+        if use_postgres():
+            with conn.cursor() as cur:
+                cur.execute("SELECT shop_domain FROM shop_tokens ORDER BY shop_domain")
+                rows = cur.fetchall()
+                return [row[0] for row in rows]
         rows = conn.execute(
             "SELECT shop_domain FROM shop_tokens ORDER BY shop_domain"
         ).fetchall()
@@ -167,6 +221,7 @@ if not SHOPIFY_CLIENT_ID or not SHOPIFY_API_SECRET:
 # Required for OAuth token exchange
 shopify.Session.setup(api_key=SHOPIFY_CLIENT_ID, secret=SHOPIFY_API_SECRET)
 init_token_db()
+logger.info(f"🗄️ Token DB backend: {'PostgreSQL' if use_postgres() else 'SQLite'}")
 
 # Optional bootstrap token (single-shop fallback)
 if SHOPIFY_ACCESS_TOKEN and SHOP_URL and not get_shop_token(SHOP_URL):

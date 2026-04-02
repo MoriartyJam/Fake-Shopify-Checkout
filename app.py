@@ -327,6 +327,25 @@ def log_shipping_address(address):
     logger.info("-" * 80)
 
 
+def get_variant_stock_snapshot(variant_id):
+    """Возвращает остаток как в админке Shopify: total available across all locations."""
+    try:
+        variant = shopify.Variant.find(variant_id)
+        inventory_management = getattr(variant, "inventory_management", None)
+        tracked = bool(inventory_management)
+        available_qty = getattr(variant, "inventory_quantity", None) if tracked else None
+        return {
+            "tracked": tracked,
+            "available_qty": available_qty
+        }
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось получить остаток для variant_id={variant_id}: {str(e)}")
+        return {
+            "tracked": False,
+            "available_qty": None
+        }
+
+
 @app.route('/auth', methods=['GET'])
 def auth():
     """Start Shopify OAuth install flow."""
@@ -569,9 +588,20 @@ def create_draft_order():
         # Товары в заказе
         draft_order.line_items = []
         for item in data['line_items']:
+            stock_snapshot = get_variant_stock_snapshot(item['variant_id'])
+            stock_value = (
+                str(stock_snapshot['available_qty'])
+                if stock_snapshot['available_qty'] is not None
+                else "unknown"
+            )
+
             line_item = {
                 'variant_id': item['variant_id'],
-                'quantity': item['quantity']
+                'quantity': item['quantity'],
+                'properties': [
+                    {'name': 'stock_available', 'value': stock_value},
+                    {'name': 'inventory_tracked', 'value': 'true' if stock_snapshot['tracked'] else 'false'}
+                ]
             }
             draft_order.line_items.append(line_item)
         

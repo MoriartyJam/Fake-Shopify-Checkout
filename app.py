@@ -230,10 +230,25 @@ if SHOPIFY_ACCESS_TOKEN and SHOP_URL and not get_shop_token(SHOP_URL):
 
 def activate_shop_session(shop_domain):
     token = get_shop_token(shop_domain)
+    resolved_shop = shop_domain
+
+    # Single-shop fallback: if request shop has no token, reuse configured SHOP_URL token.
+    if not token and SHOP_URL and shop_domain != SHOP_URL:
+        fallback_token = get_shop_token(SHOP_URL)
+        if fallback_token:
+            logger.warning(
+                f"⚠️ No token for requested shop={shop_domain}. "
+                f"Using fallback token for SHOP_URL={SHOP_URL}."
+            )
+            token = fallback_token
+            resolved_shop = SHOP_URL
+
     if not token:
         raise ValueError(f"No access token for shop: {shop_domain}. Install app via /auth first.")
-    session = shopify.Session(shop_domain, API_VERSION, token)
+
+    session = shopify.Session(resolved_shop, API_VERSION, token)
     shopify.ShopifyResource.activate_session(session)
+    return resolved_shop
 
 
 def validate_hmac(query_params):
@@ -554,7 +569,8 @@ def create_draft_order():
 
         # Активируем Shopify session для нужного магазина
         request_shop = data.get("shop") or request.args.get("shop") or SHOP_URL
-        activate_shop_session(request_shop)
+        active_shop = activate_shop_session(request_shop)
+        logger.info(f"🏪 Active shop session: requested={request_shop}, resolved={active_shop}")
         
         # Создание draft order
         logger.info("🔨 СОЗДАНИЕ DRAFT ORDER...")

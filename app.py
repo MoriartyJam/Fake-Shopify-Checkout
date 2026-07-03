@@ -243,6 +243,15 @@ def activate_shop_session(shop_domain):
             token = fallback_token
             resolved_shop = SHOP_URL
 
+    # Environment-token fallback for single-shop deployments with empty/ephemeral DB.
+    if not token and SHOPIFY_ACCESS_TOKEN:
+        resolved_shop = SHOP_URL or shop_domain
+        token = SHOPIFY_ACCESS_TOKEN
+        logger.warning(
+            f"⚠️ No DB token for shop={shop_domain}. "
+            f"Using SHOPIFY_ACCESS_TOKEN for resolved_shop={resolved_shop}."
+        )
+
     if not token:
         raise ValueError(f"No access token for shop: {shop_domain}. Install app via /auth first.")
 
@@ -339,6 +348,16 @@ def log_shipping_address(address):
     logger.info(f"  Провинция: {mask_text(address.get('province', ''))}")
     logger.info(f"  Страна: {address.get('country', 'N/A')}")
     logger.info(f"  Индекс: {mask_text(address.get('zip', ''), keep=2)}")
+    logger.info("-" * 80)
+
+
+def log_exit_customer_request(data):
+    logger.info("=" * 80)
+    logger.info("📥 ПОЛУЧЕН ЗАПРОС НА СОЗДАНИЕ CUSTOMER ИЗ EXIT POPUP")
+    logger.info("=" * 80)
+    logger.info(f"👤 Имя: {mask_text(data.get('customer', {}).get('first_name', ''))}")
+    logger.info(f"📞 Телефон: {mask_phone(data.get('customer', {}).get('phone'))}")
+    logger.info(f"🏷️ Тег: {data.get('tag', 'exit')}")
     logger.info("-" * 80)
 
 
@@ -673,6 +692,98 @@ def create_draft_order():
         import traceback
         logger.error(f"Traceback:\n{traceback.format_exc()}")
         
+        return jsonify({
+            'success': False,
+            'message': f'Server error: {str(e)}'
+        }), 500
+    finally:
+        shopify.ShopifyResource.clear_session()
+
+
+@app.route('/api/exit-customer', methods=['POST', 'OPTIONS'])
+def create_exit_customer():
+    """Создание customer из exit-intent popup"""
+
+    if request.method == 'OPTIONS':
+        logger.debug("🔄 CORS preflight запрос для /api/exit-customer")
+        return '', 204
+
+    try:
+        data = request.get_json()
+
+        if not data:
+            logger.error("❌ Пустой запрос - данные не получены")
+            return jsonify({
+                'success': False,
+                'message': 'No data received'
+            }), 400
+
+        customer_data = data.get('customer') or {}
+        first_name = (customer_data.get('first_name') or '').strip()
+        phone = (customer_data.get('phone') or '').strip()
+        tag = (data.get('tag') or 'exit').strip()
+
+        log_exit_customer_request(data)
+
+        if not first_name or not phone:
+            logger.error("❌ Отсутствует имя или телефон")
+            return jsonify({
+                'success': False,
+                'message': 'Missing required fields: customer.first_name, customer.phone'
+            }), 400
+
+        request_shop = data.get("shop") or request.args.get("shop") or SHOP_URL
+        active_shop = activate_shop_session(request_shop)
+        logger.info(f"🏪 Active shop session: requested={request_shop}, resolved={active_shop}")
+
+        logger.info("🔨 СОЗДАНИЕ CUSTOMER...")
+
+        customer = shopify.Customer()
+        customer.first_name = first_name
+        customer.phone = phone
+        customer.tags = tag
+
+        if customer.save():
+            logger.info("=" * 80)
+            logger.info("✅ CUSTOMER УСПЕШНО СОЗДАН!")
+            logger.info("=" * 80)
+            logger.info(f"🆔 Customer ID: {customer.id}")
+            logger.info(f"👤 Имя: {mask_text(customer.first_name)}")
+            logger.info(f"📞 Телефон: {mask_phone(customer.phone)}")
+            logger.info(f"🏷️ Теги: {customer.tags}")
+            logger.info("=" * 80)
+
+            return jsonify({
+                'success': True,
+                'message': 'Customer created successfully',
+                'customer_id': customer.id,
+                'tags': customer.tags
+            }), 200
+
+        errors = customer.errors.full_messages()
+        logger.error("=" * 80)
+        logger.error("❌ ОШИБКА ПРИ СОЗДАНИИ CUSTOMER")
+        logger.error("=" * 80)
+        logger.error(f"Ошибки валидации: {errors}")
+        logger.error("=" * 80)
+
+        return jsonify({
+            'success': False,
+            'message': 'Failed to create customer',
+            'errors': errors
+        }), 400
+
+    except Exception as e:
+        logger.error("=" * 80)
+        logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА В /api/exit-customer")
+        logger.error("=" * 80)
+        logger.error(f"Тип ошибки: {type(e).__name__}")
+        logger.error(f"Сообщение: {str(e)}")
+        logger.error("=" * 80)
+
+        import traceback
+        logger.error(f"Traceback:\n{traceback.format_exc()}")
+
         return jsonify({
             'success': False,
             'message': f'Server error: {str(e)}'

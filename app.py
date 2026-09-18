@@ -56,7 +56,10 @@ logger.addHandler(memory_handler)
 # Shopify app credentials (set as server environment variables)
 SHOPIFY_CLIENT_ID = os.getenv("CLIENT_ID", "")
 SHOPIFY_API_SECRET = os.getenv("API_SECRET", "")
-SHOPIFY_SCOPES = os.getenv("SCOPES", "read_products,write_products,write_inventory")
+SHOPIFY_SCOPES = os.getenv(
+    "SCOPES",
+    "read_products,write_products,write_inventory,write_metaobjects,write_metaobject_definitions"
+)
 SHOP_URL = os.getenv("SHOP_URL", "")
 APP_URL = os.getenv("APP_URL", "")
 REDIRECT_URI = f"{APP_URL}/auth/callback" if APP_URL else ""
@@ -68,6 +71,10 @@ TOKEN_DB_PATH = os.getenv("TOKEN_DB_PATH", "shop_tokens.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY", "")
 ENCRYPTED_TOKEN_PREFIX = "enc:"
+EXIT_SURVEY_METAOBJECT_TYPE = "exit_survey_response"
+EXIT_SURVEY_RATE_LIMIT = int(os.getenv("EXIT_SURVEY_RATE_LIMIT", "20"))
+EXIT_SURVEY_RATE_WINDOW_SECONDS = int(os.getenv("EXIT_SURVEY_RATE_WINDOW_SECONDS", "3600"))
+EXIT_SURVEY_REQUESTS = {}
 
 fernet = None
 if TOKEN_ENCRYPTION_KEY:
@@ -378,6 +385,150 @@ def get_variant_stock_snapshot(variant_id):
             "tracked": False,
             "available_qty": None
         }
+
+
+def execute_shopify_graphql(query, variables=None):
+    """Execute Admin GraphQL using the currently active Shopify session."""
+    raw_response = shopify.GraphQL().execute(query, variables=variables or {})
+    response = json.loads(raw_response)
+    if response.get("errors"):
+        raise RuntimeError(f"Shopify GraphQL errors: {response['errors']}")
+    return response.get("data") or {}
+
+
+def ensure_exit_survey_definition():
+    """Create the merchant-visible Metaobject definition once, if necessary."""
+    lookup_query = """
+    query ExitSurveyDefinition($type: String!) {
+      metaobjectDefinitionByType(type: $type) {
+        id
+        type
+      }
+    }
+    """
+    lookup = execute_shopify_graphql(
+        lookup_query,
+        {"type": EXIT_SURVEY_METAOBJECT_TYPE}
+    )
+    existing = lookup.get("metaobjectDefinitionByType")
+    if existing:
+        return existing["id"]
+
+    create_mutation = """
+    mutation CreateExitSurveyDefinition($definition: MetaobjectDefinitionCreateInput!) {
+      metaobjectDefinitionCreate(definition: $definition) {
+        metaobjectDefinition {
+          id
+          type
+        }
+        userErrors {
+          field
+          message
+          code
+        }
+      }
+    }
+    """
+    definition = {
+        "name": "Exit survey response",
+        "type": EXIT_SURVEY_METAOBJECT_TYPE,
+        "description": "Anonymous feedback collected by the MIXOpro exit-intent popup.",
+        "displayNameKey": "reason",
+        "access": {
+            "admin": "MERCHANT_READ_WRITE"
+        },
+        "fieldDefinitions": [
+            {"name": "Reason", "key": "reason", "type": "single_line_text_field", "required": True},
+            {"name": "Comment", "key": "comment", "type": "multi_line_text_field"},
+            {"name": "Page URL", "key": "page_url", "type": "url"},
+            {"name": "Page title", "key": "page_title", "type": "single_line_text_field"},
+            {"name": "Locale", "key": "locale", "type": "single_line_text_field"},
+            {"name": "Trigger", "key": "trigger", "type": "single_line_text_field"},
+            {"name": "Source", "key": "source", "type": "single_line_text_field"},
+            {"name": "Submitted at", "key": "submitted_at", "type": "date_time", "required": True}
+        ]
+    }
+    created = execute_shopify_graphql(
+        create_mutation,
+        {"definition": definition}
+    ).get("metaobjectDefinitionCreate") or {}
+    user_errors = created.get("userErrors") or []
+    if user_errors:
+        # Another request might have created it between lookup and mutation.
+        repeated_lookup = execute_shopify_graphql(
+            lookup_query,
+            {"type": EXIT_SURVEY_METAOBJECT_TYPE}
+        ).get("metaobjectDefinitionByType")
+        if repeated_lookup:
+            return repeated_lookup["id"]
+        raise ValueError(f"Metaobject definition errors: {user_errors}")
+
+    metaobject_definition = created.get("metaobjectDefinition")
+    if not metaobject_definition:
+        raise RuntimeError("Shopify did not return the created Metaobject definition.")
+    return metaobject_definition["id"]
+
+
+def create_exit_survey_metaobject(payload):
+    ensure_exit_survey_definition()
+    create_mutation = """
+    mutation CreateExitSurveyResponse($metaobject: MetaobjectCreateInput!) {
+      metaobjectCreate(metaobject: $metaobject) {
+        metaobject {
+          id
+          handle
+          displayName
+        }
+        userErrors {
+          field
+          message
+          code
+        }
+      }
+    }
+    """
+    handle = f"exit-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}"
+    fields = [
+        {"key": "reason", "value": payload["reason"]},
+        {"key": "comment", "value": payload.get("comment", "")},
+        {"key": "page_url", "value": payload.get("page_url", "")},
+        {"key": "page_title", "value": payload.get("page_title", "")},
+        {"key": "locale", "value": payload.get("locale", "")},
+        {"key": "trigger", "value": payload.get("trigger", "")},
+        {"key": "source", "value": payload.get("source", "exit_intent_survey")},
+        {"key": "submitted_at", "value": payload["submitted_at"]}
+    ]
+    result = execute_shopify_graphql(
+        create_mutation,
+        {
+            "metaobject": {
+                "type": EXIT_SURVEY_METAOBJECT_TYPE,
+                "handle": handle,
+                "fields": fields
+            }
+        }
+    ).get("metaobjectCreate") or {}
+    user_errors = result.get("userErrors") or []
+    if user_errors:
+        raise ValueError(f"Metaobject create errors: {user_errors}")
+    metaobject = result.get("metaobject")
+    if not metaobject:
+        raise RuntimeError("Shopify did not return the created Metaobject.")
+    return metaobject
+
+
+def exit_survey_rate_limited():
+    """Small in-process spam guard; use a shared rate limiter for multi-instance deploys."""
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    client_ip = forwarded_for.split(",", 1)[0].strip() or request.remote_addr or "unknown"
+    now = datetime.now().timestamp()
+    recent = EXIT_SURVEY_REQUESTS.setdefault(client_ip, deque())
+    while recent and now - recent[0] > EXIT_SURVEY_RATE_WINDOW_SECONDS:
+        recent.popleft()
+    if len(recent) >= EXIT_SURVEY_RATE_LIMIT:
+        return True
+    recent.append(now)
+    return False
 
 
 @app.route('/auth', methods=['GET'])
@@ -700,6 +851,82 @@ def create_draft_order():
         shopify.ShopifyResource.clear_session()
 
 
+@app.route('/api/exit-survey', methods=['POST', 'OPTIONS'])
+def create_exit_survey():
+    """Store an anonymous exit-intent survey response as a Shopify Metaobject."""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    if exit_survey_rate_limited():
+        return jsonify({
+            'success': False,
+            'message': 'Too many survey submissions. Please try again later.'
+        }), 429
+
+    try:
+        data = request.get_json(silent=True) or {}
+        reason = str(data.get('reason') or '').strip()[:160]
+        comment = str(data.get('comment') or '').strip()[:500]
+        page_url = str(data.get('page_url') or '').strip()[:1000]
+        page_title = str(data.get('page_title') or '').strip()[:200]
+        locale = str(data.get('locale') or '').strip()[:20]
+        trigger = str(data.get('trigger') or '').strip()[:50]
+        source = str(data.get('source') or 'exit_intent_survey').strip()[:80]
+        submitted_at = str(data.get('submitted_at') or '').strip()
+
+        if not reason:
+            return jsonify({
+                'success': False,
+                'message': 'Missing required field: reason'
+            }), 400
+
+        try:
+            parsed_submitted_at = datetime.fromisoformat(submitted_at.replace('Z', '+00:00'))
+            normalized_submitted_at = parsed_submitted_at.isoformat()
+        except (TypeError, ValueError):
+            normalized_submitted_at = datetime.utcnow().isoformat() + 'Z'
+
+        request_shop = data.get('shop') or request.args.get('shop') or SHOP_URL
+        if not request_shop:
+            return jsonify({
+                'success': False,
+                'message': 'Shop is not configured.'
+            }), 500
+
+        active_shop = activate_shop_session(request_shop)
+        logger.info(
+            f"📊 Exit survey: shop={active_shop}, reason={mask_text(reason, keep=12)}, "
+            f"locale={locale or 'unknown'}, trigger={trigger or 'unknown'}"
+        )
+
+        metaobject = create_exit_survey_metaobject({
+            'reason': reason,
+            'comment': comment,
+            'page_url': page_url,
+            'page_title': page_title,
+            'locale': locale,
+            'trigger': trigger,
+            'source': source,
+            'submitted_at': normalized_submitted_at
+        })
+
+        logger.info(f"✅ Exit survey saved: {metaobject['id']}")
+        return jsonify({
+            'success': True,
+            'message': 'Survey response saved successfully.',
+            'metaobject_id': metaobject['id']
+        }), 201
+
+    except Exception as e:
+        logger.exception("❌ Error in /api/exit-survey")
+        return jsonify({
+            'success': False,
+            'message': f'Server error: {str(e)}'
+        }), 500
+    finally:
+        shopify.ShopifyResource.clear_session()
+
+
 @app.route('/api/exit-customer', methods=['POST', 'OPTIONS'])
 def create_exit_customer():
     """Создание customer из exit-intent popup"""
@@ -830,6 +1057,7 @@ if __name__ == '__main__':
     logger.info(f"🔌 Порт: {PORT}")
     logger.info(f"🔗 Endpoints:")
     logger.info(f"   - POST http://localhost:{PORT}/api/create-draft")
+    logger.info(f"   - POST http://localhost:{PORT}/api/exit-survey")
     logger.info(f"   - GET  http://localhost:{PORT}/api/test")
     logger.info(f"   - GET  http://localhost:{PORT}/health")
     logger.info(f"   - POST http://localhost:{PORT}/webhooks/app-uninstalled")

@@ -430,23 +430,20 @@ def ensure_exit_survey_definition():
     }
     """
     definition = {
-        "name": "Exit survey response",
-        "type": EXIT_SURVEY_METAOBJECT_TYPE,
-        "description": "Anonymous feedback collected by the MIXOpro exit-intent popup.",
-        "displayNameKey": "reason",
-        "access": {
-            "admin": "MERCHANT_READ_WRITE"
-        },
-        "fieldDefinitions": [
-            {"name": "Reason", "key": "reason", "type": "single_line_text_field", "required": True},
-            {"name": "Comment", "key": "comment", "type": "multi_line_text_field"},
-            {"name": "Page URL", "key": "page_url", "type": "url"},
-            {"name": "Page title", "key": "page_title", "type": "single_line_text_field"},
-            {"name": "Locale", "key": "locale", "type": "single_line_text_field"},
-            {"name": "Trigger", "key": "trigger", "type": "single_line_text_field"},
-            {"name": "Source", "key": "source", "type": "single_line_text_field"},
-            {"name": "Submitted at", "key": "submitted_at", "type": "date_time", "required": True}
-        ]
+    "name": "Exit survey response",
+    "type": EXIT_SURVEY_METAOBJECT_TYPE,
+    "description": "Anonymous feedback collected by the MIXOpro exit-intent popup.",
+    "displayNameKey": "reason",
+    "fieldDefinitions": [
+        {"name": "Reason", "key": "reason", "type": "single_line_text_field", "required": True},
+        {"name": "Comment", "key": "comment", "type": "multi_line_text_field"},
+        {"name": "Page URL", "key": "page_url", "type": "url"},
+        {"name": "Page title", "key": "page_title", "type": "single_line_text_field"},
+        {"name": "Locale", "key": "locale", "type": "single_line_text_field"},
+        {"name": "Trigger", "key": "trigger", "type": "single_line_text_field"},
+        {"name": "Source", "key": "source", "type": "single_line_text_field"},
+        {"name": "Submitted at", "key": "submitted_at", "type": "date_time", "required": True}
+    ]
     }
     created = execute_shopify_graphql(
         create_mutation,

@@ -6,10 +6,14 @@ import hmac
 import hashlib
 import base64
 import sqlite3
+import re
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from flask import Flask, request, jsonify, redirect, render_template_string
 from flask_cors import CORS
+import requests
 import shopify
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -58,7 +62,7 @@ SHOPIFY_CLIENT_ID = os.getenv("CLIENT_ID", "")
 SHOPIFY_API_SECRET = os.getenv("API_SECRET", "")
 SHOPIFY_SCOPES = os.getenv(
     "SCOPES",
-    "read_products,write_products,write_inventory,write_metaobjects,write_metaobject_definitions"
+    "read_products,write_products,write_inventory,read_metaobjects,write_metaobjects,read_metaobject_definitions,write_metaobject_definitions"
 )
 SHOP_URL = os.getenv("SHOP_URL", "")
 APP_URL = os.getenv("APP_URL", "")
@@ -75,6 +79,36 @@ EXIT_SURVEY_METAOBJECT_TYPE = "exit_survey_response"
 EXIT_SURVEY_RATE_LIMIT = int(os.getenv("EXIT_SURVEY_RATE_LIMIT", "20"))
 EXIT_SURVEY_RATE_WINDOW_SECONDS = int(os.getenv("EXIT_SURVEY_RATE_WINDOW_SECONDS", "3600"))
 EXIT_SURVEY_REQUESTS = {}
+COMPETITOR_CRON_SECRET = os.getenv("COMPETITOR_CRON_SECRET", "")
+COMPETITOR_TAG = "competitor-price-compare"
+COMPETITOR_NAMESPACE = "price_comparison"
+COMPETITOR_TIMEOUT_SECONDS = int(os.getenv("COMPETITOR_TIMEOUT_SECONDS", "15"))
+COMPETITOR_USER_AGENT = os.getenv(
+    "COMPETITOR_USER_AGENT",
+    "MIXOproPriceMonitor/1.0 (+https://mixopro.store)"
+)
+COMPETITOR_SOURCES = {
+    "monin_url": {
+        "name": "MONIN.ca",
+        "hosts": {"monin.ca", "www.monin.ca"}
+    },
+    "cocktail_emporium_url": {
+        "name": "Cocktail Emporium",
+        "hosts": {"cocktailemporium.com", "www.cocktailemporium.com"}
+    },
+    "kitchen_barista_url": {
+        "name": "The Kitchen Barista",
+        "hosts": {"thekitchenbarista.com", "www.thekitchenbarista.com"}
+    },
+    "ecs_coffee_url": {
+        "name": "ECS Coffee",
+        "hosts": {"ecscoffee.com", "www.ecscoffee.com"}
+    },
+    "mayrand_url": {
+        "name": "Mayrand",
+        "hosts": {"mayrand.ca", "www.mayrand.ca"}
+    }
+}
 
 fernet = None
 if TOKEN_ENCRYPTION_KEY:
@@ -430,20 +464,20 @@ def ensure_exit_survey_definition():
     }
     """
     definition = {
-    "name": "Exit survey response",
-    "type": EXIT_SURVEY_METAOBJECT_TYPE,
-    "description": "Anonymous feedback collected by the MIXOpro exit-intent popup.",
-    "displayNameKey": "reason",
-    "fieldDefinitions": [
-        {"name": "Reason", "key": "reason", "type": "single_line_text_field", "required": True},
-        {"name": "Comment", "key": "comment", "type": "multi_line_text_field"},
-        {"name": "Page URL", "key": "page_url", "type": "url"},
-        {"name": "Page title", "key": "page_title", "type": "single_line_text_field"},
-        {"name": "Locale", "key": "locale", "type": "single_line_text_field"},
-        {"name": "Trigger", "key": "trigger", "type": "single_line_text_field"},
-        {"name": "Source", "key": "source", "type": "single_line_text_field"},
-        {"name": "Submitted at", "key": "submitted_at", "type": "date_time", "required": True}
-    ]
+        "name": "Exit survey response",
+        "type": EXIT_SURVEY_METAOBJECT_TYPE,
+        "description": "Anonymous feedback collected by the MIXOpro exit-intent popup.",
+        "displayNameKey": "reason",
+        "fieldDefinitions": [
+            {"name": "Reason", "key": "reason", "type": "single_line_text_field", "required": True},
+            {"name": "Comment", "key": "comment", "type": "multi_line_text_field"},
+            {"name": "Page URL", "key": "page_url", "type": "url"},
+            {"name": "Page title", "key": "page_title", "type": "single_line_text_field"},
+            {"name": "Locale", "key": "locale", "type": "single_line_text_field"},
+            {"name": "Trigger", "key": "trigger", "type": "single_line_text_field"},
+            {"name": "Source", "key": "source", "type": "single_line_text_field"},
+            {"name": "Submitted at", "key": "submitted_at", "type": "date_time", "required": True}
+        ]
     }
     created = execute_shopify_graphql(
         create_mutation,
@@ -526,6 +560,378 @@ def exit_survey_rate_limited():
         return True
     recent.append(now)
     return False
+
+
+class JsonLdScriptParser(HTMLParser):
+    """Collect JSON-LD script bodies without adding an HTML parser dependency."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._inside_json_ld = False
+        self._buffer = []
+        self.scripts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "script":
+            return
+        attributes = {key.lower(): (value or "") for key, value in attrs}
+        self._inside_json_ld = "ld+json" in attributes.get("type", "").lower()
+        self._buffer = []
+
+    def handle_data(self, data):
+        if self._inside_json_ld:
+            self._buffer.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "script" and self._inside_json_ld:
+            self.scripts.append("".join(self._buffer).strip())
+            self._inside_json_ld = False
+            self._buffer = []
+
+
+def competitor_request_is_authorized():
+    if not COMPETITOR_CRON_SECRET:
+        return False
+    authorization = request.headers.get("Authorization", "")
+    supplied = request.headers.get("X-Cron-Secret", "")
+    if authorization.startswith("Bearer "):
+        supplied = authorization[7:]
+    return hmac.compare_digest(str(supplied), COMPETITOR_CRON_SECRET)
+
+
+def ensure_competitor_metafield_definitions():
+    """Create pinned URL fields and unpinned parser-owned output fields."""
+    definitions = []
+    for key, source in COMPETITOR_SOURCES.items():
+        definitions.append({
+            "name": f"{source['name']} product URL",
+            "namespace": COMPETITOR_NAMESPACE,
+            "key": key,
+            "description": f"Paste the matching {source['name']} product or variant URL. Price is updated automatically.",
+            "type": "url",
+            "ownerType": "PRODUCT",
+            "pin": True
+        })
+    definitions.extend([
+        {
+            "name": "Competitor price results",
+            "namespace": COMPETITOR_NAMESPACE,
+            "key": "results",
+            "description": "Managed automatically by the MIXOpro competitor price monitor.",
+            "type": "json",
+            "ownerType": "PRODUCT",
+            "pin": False
+        },
+        {
+            "name": "Competitor prices checked at",
+            "namespace": COMPETITOR_NAMESPACE,
+            "key": "last_checked_at",
+            "description": "Last automatic competitor price check.",
+            "type": "date_time",
+            "ownerType": "PRODUCT",
+            "pin": False
+        }
+    ])
+
+    mutation = """
+    mutation CreateCompetitorMetafieldDefinition($definition: MetafieldDefinitionInput!) {
+      metafieldDefinitionCreate(definition: $definition) {
+        createdDefinition { id name namespace key }
+        userErrors { field message code }
+      }
+    }
+    """
+    created = []
+    existing = []
+    for definition in definitions:
+        payload = execute_shopify_graphql(mutation, {"definition": definition}).get(
+            "metafieldDefinitionCreate"
+        ) or {}
+        errors = payload.get("userErrors") or []
+        if errors:
+            if all(error.get("code") == "TAKEN" for error in errors):
+                existing.append(definition["key"])
+                continue
+            raise ValueError(f"Metafield definition errors for {definition['key']}: {errors}")
+        created.append(definition["key"])
+    return {"created": created, "existing": existing}
+
+
+def clean_competitor_url(raw_url, source_key):
+    source = COMPETITOR_SOURCES[source_key]
+    parsed = urlparse((raw_url or "").strip())
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or hostname not in source["hosts"]:
+        raise ValueError(f"URL must use HTTPS and belong to {source['name']}")
+    if "/products/" not in parsed.path:
+        raise ValueError("URL must point to a product page")
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    kept_query = {}
+    for key in ("variant", "currency", "country"):
+        if query.get(key):
+            kept_query[key] = query[key][0]
+    return urlunparse((
+        "https",
+        hostname,
+        parsed.path.rstrip("/"),
+        "",
+        urlencode(kept_query),
+        ""
+    ))
+
+
+def shopify_product_json_url(product_url):
+    parsed = urlparse(product_url)
+    path = re.sub(r"(/products/[^/?]+?)(?:\.js)?$", r"\1.js", parsed.path)
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", parsed.query, ""))
+
+
+def parse_money_value(value):
+    if value is None or isinstance(value, bool):
+        raise ValueError("Price is missing")
+    if isinstance(value, (int, float)):
+        return float(value)
+    normalized = re.sub(r"[^0-9,.-]", "", str(value)).strip()
+    if not normalized:
+        raise ValueError("Price is missing")
+    if "," in normalized and "." not in normalized:
+        normalized = normalized.replace(",", ".")
+    elif "," in normalized and "." in normalized:
+        normalized = normalized.replace(",", "")
+    return float(normalized)
+
+
+def parse_shopify_product_json(response, product_url):
+    data = response.json()
+    variants = data.get("variants") or []
+    query = parse_qs(urlparse(product_url).query)
+    requested_variant = (query.get("variant") or [""])[0]
+    variant = None
+    if requested_variant:
+        variant = next(
+            (item for item in variants if str(item.get("id")) == str(requested_variant)),
+            None
+        )
+        if not variant:
+            raise ValueError(f"Variant {requested_variant} was not found")
+    elif variants:
+        variant = variants[0]
+
+    price_raw = variant.get("price") if variant else data.get("price")
+    price = parse_money_value(price_raw)
+    # Shopify Ajax product JSON expresses money values in minor units.
+    price /= 100
+    currency = (
+        data.get("currency")
+        or (query.get("currency") or [""])[0]
+        or "CAD"
+    ).upper()
+    available = variant.get("available") if variant else data.get("available", True)
+    return {
+        "price": round(price, 2),
+        "currency": currency,
+        "available": bool(available),
+        "variant_id": str(variant.get("id")) if variant else "",
+        "variant_title": str(variant.get("title") or "") if variant else "",
+        "product_title": str(data.get("title") or ""),
+        "parser": "shopify-product-json"
+    }
+
+
+def iter_json_objects(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from iter_json_objects(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from iter_json_objects(child)
+
+
+def parse_product_json_ld(html):
+    parser = JsonLdScriptParser()
+    parser.feed(html)
+    for script in parser.scripts:
+        if not script:
+            continue
+        try:
+            document = json.loads(script)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for item in iter_json_objects(document):
+            item_type = item.get("@type")
+            types = item_type if isinstance(item_type, list) else [item_type]
+            if "Product" not in types:
+                continue
+            offers = item.get("offers")
+            if isinstance(offers, list):
+                offers = offers[0] if offers else None
+            if not isinstance(offers, dict):
+                continue
+            price_raw = offers.get("price") or offers.get("lowPrice")
+            if price_raw is None:
+                price_specification = offers.get("priceSpecification") or {}
+                if isinstance(price_specification, list):
+                    price_specification = price_specification[0] if price_specification else {}
+                price_raw = price_specification.get("price")
+            if price_raw is None:
+                continue
+            availability = str(offers.get("availability") or "")
+            return {
+                "price": round(parse_money_value(price_raw), 2),
+                "currency": str(offers.get("priceCurrency") or "CAD").upper(),
+                "available": "OutOfStock" not in availability and "SoldOut" not in availability,
+                "variant_id": "",
+                "variant_title": "",
+                "product_title": str(item.get("name") or ""),
+                "parser": "json-ld"
+            }
+    raise ValueError("No product offer with a price was found")
+
+
+def fetch_competitor_price(source_key, raw_url):
+    source = COMPETITOR_SOURCES[source_key]
+    cleaned_url = clean_competitor_url(raw_url, source_key)
+    headers = {
+        "User-Agent": COMPETITOR_USER_AGENT,
+        "Accept": "application/json,text/html;q=0.9,*/*;q=0.8"
+    }
+    checked_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    json_error = None
+    try:
+        response = requests.get(
+            shopify_product_json_url(cleaned_url),
+            headers=headers,
+            timeout=COMPETITOR_TIMEOUT_SECONDS,
+            allow_redirects=True
+        )
+        response.raise_for_status()
+        parsed = parse_shopify_product_json(response, cleaned_url)
+    except (requests.RequestException, ValueError, json.JSONDecodeError) as error:
+        json_error = str(error)
+        response = requests.get(
+            cleaned_url,
+            headers=headers,
+            timeout=COMPETITOR_TIMEOUT_SECONDS,
+            allow_redirects=True
+        )
+        response.raise_for_status()
+        parsed = parse_product_json_ld(response.text)
+
+    parsed.update({
+        "key": source_key,
+        "name": source["name"],
+        "url": cleaned_url,
+        "price_cents": int(round(parsed["price"] * 100)),
+        "status": "ok" if parsed.get("available") else "unavailable",
+        "checked_at": checked_at
+    })
+    if json_error and parsed.get("parser") == "json-ld":
+        parsed["fallback_reason"] = json_error[:240]
+    return parsed
+
+
+def get_competitor_products():
+    metafield_lines = "\n".join(
+        f'{key}: metafield(namespace: "{COMPETITOR_NAMESPACE}", key: "{key}") {{ value }}'
+        for key in COMPETITOR_SOURCES
+    )
+    query = """
+    query CompetitorProducts($after: String) {
+      products(first: 50, after: $after, query: "tag:%s") {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          title
+          handle
+          %s
+        }
+      }
+    }
+    """ % (COMPETITOR_TAG, metafield_lines)
+    products = []
+    after = None
+    while True:
+        connection = execute_shopify_graphql(query, {"after": after}).get("products") or {}
+        products.extend(connection.get("nodes") or [])
+        page_info = connection.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            return products
+        after = page_info.get("endCursor")
+
+
+def save_competitor_results(product_id, results, checked_at):
+    mutation = """
+    mutation SaveCompetitorPrices($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields { id key updatedAt }
+        userErrors { field message code }
+      }
+    }
+    """
+    metafields = [
+        {
+            "ownerId": product_id,
+            "namespace": COMPETITOR_NAMESPACE,
+            "key": "results",
+            "type": "json",
+            "value": json.dumps(results, ensure_ascii=False, separators=(",", ":"))
+        },
+        {
+            "ownerId": product_id,
+            "namespace": COMPETITOR_NAMESPACE,
+            "key": "last_checked_at",
+            "type": "date_time",
+            "value": checked_at
+        }
+    ]
+    payload = execute_shopify_graphql(mutation, {"metafields": metafields}).get("metafieldsSet") or {}
+    errors = payload.get("userErrors") or []
+    if errors:
+        raise ValueError(f"Metafield save errors: {errors}")
+
+
+def refresh_competitor_prices():
+    products = get_competitor_products()
+    summary = {"products_found": len(products), "products_updated": 0, "sources_ok": 0, "sources_failed": 0, "products": []}
+    for product in products:
+        checked_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        results = []
+        for source_key, source in COMPETITOR_SOURCES.items():
+            metafield = product.get(source_key) or {}
+            raw_url = metafield.get("value") or ""
+            if not raw_url:
+                continue
+            try:
+                result = fetch_competitor_price(source_key, raw_url)
+                summary["sources_ok"] += 1
+                logger.info(
+                    f"💰 Competitor price: product={product['handle']}, source={source['name']}, "
+                    f"price={result['price']} {result['currency']}"
+                )
+            except Exception as error:
+                summary["sources_failed"] += 1
+                result = {
+                    "key": source_key,
+                    "name": source["name"],
+                    "url": raw_url,
+                    "status": "error",
+                    "error": str(error)[:300],
+                    "checked_at": checked_at
+                }
+                logger.warning(
+                    f"⚠️ Competitor price failed: product={product['handle']}, "
+                    f"source={source['name']}, error={error}"
+                )
+            results.append(result)
+        save_competitor_results(product["id"], results, checked_at)
+        summary["products_updated"] += 1
+        summary["products"].append({
+            "handle": product["handle"],
+            "sources": len(results),
+            "visible_prices": sum(1 for result in results if result.get("status") == "ok")
+        })
+    return summary
 
 
 @app.route('/auth', methods=['GET'])
@@ -1016,6 +1422,43 @@ def create_exit_customer():
         shopify.ShopifyResource.clear_session()
 
 
+@app.route('/api/competitor-prices/setup', methods=['POST'])
+def setup_competitor_prices():
+    """Create the product metafield definitions used by the price monitor."""
+    if not competitor_request_is_authorized():
+        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
+    try:
+        request_shop = request.args.get("shop") or SHOP_URL
+        activate_shop_session(request_shop)
+        result = ensure_competitor_metafield_definitions()
+        logger.info(f"✅ Competitor price metafields ready: {result}")
+        return jsonify({'success': True, **result}), 200
+    except Exception as error:
+        logger.exception("❌ Error in /api/competitor-prices/setup")
+        return jsonify({'success': False, 'message': str(error)}), 500
+    finally:
+        shopify.ShopifyResource.clear_session()
+
+
+@app.route('/api/competitor-prices/refresh', methods=['POST'])
+def refresh_competitor_prices_endpoint():
+    """Refresh all tagged products; intended for a once-daily Render Cron Job."""
+    if not competitor_request_is_authorized():
+        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
+    try:
+        request_shop = request.args.get("shop") or SHOP_URL
+        activate_shop_session(request_shop)
+        ensure_competitor_metafield_definitions()
+        summary = refresh_competitor_prices()
+        logger.info(f"✅ Competitor price refresh completed: {summary}")
+        return jsonify({'success': True, **summary}), 200
+    except Exception as error:
+        logger.exception("❌ Error in /api/competitor-prices/refresh")
+        return jsonify({'success': False, 'message': str(error)}), 500
+    finally:
+        shopify.ShopifyResource.clear_session()
+
+
 @app.route('/api/test', methods=['GET'])
 def test_connection():
     """Тестовый endpoint для проверки подключения к Shopify"""
@@ -1055,6 +1498,8 @@ if __name__ == '__main__':
     logger.info(f"🔗 Endpoints:")
     logger.info(f"   - POST http://localhost:{PORT}/api/create-draft")
     logger.info(f"   - POST http://localhost:{PORT}/api/exit-survey")
+    logger.info(f"   - POST http://localhost:{PORT}/api/competitor-prices/setup")
+    logger.info(f"   - POST http://localhost:{PORT}/api/competitor-prices/refresh")
     logger.info(f"   - GET  http://localhost:{PORT}/api/test")
     logger.info(f"   - GET  http://localhost:{PORT}/health")
     logger.info(f"   - POST http://localhost:{PORT}/webhooks/app-uninstalled")

@@ -27,7 +27,9 @@ CORS(app, resources={
             "https://www.mixopro.store",
             r"^https://[a-z0-9-]+\.myshopify\.com$",
             r"^https://[a-z0-9-]+\.shopifypreview\.com$",
-            r"^https://admin\.shopify\.com$"
+            r"^https://admin\.shopify\.com$",
+            r"^http://127\.0\.0\.1(?::\d+)?$",
+            r"^http://localhost(?::\d+)?$"
         ],
         "methods": ["POST", "OPTIONS"],
         "allow_headers": ["Content-Type"]
@@ -76,6 +78,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY", "")
 ENCRYPTED_TOKEN_PREFIX = "enc:"
 EXIT_SURVEY_METAOBJECT_TYPE = "exit_survey_response"
+MONTREAL_OFFER_METAOBJECT_TYPE = "montreal_offer_request"
 EXIT_SURVEY_RATE_LIMIT = int(os.getenv("EXIT_SURVEY_RATE_LIMIT", "20"))
 EXIT_SURVEY_RATE_WINDOW_SECONDS = int(os.getenv("EXIT_SURVEY_RATE_WINDOW_SECONDS", "3600"))
 EXIT_SURVEY_REQUESTS = {}
@@ -545,6 +548,91 @@ def create_exit_survey_metaobject(payload):
     metaobject = result.get("metaobject")
     if not metaobject:
         raise RuntimeError("Shopify did not return the created Metaobject.")
+    return metaobject
+
+
+def ensure_montreal_offer_definition():
+    """Create the Metaobject definition used by the Montréal lead Shopify Flow."""
+    lookup_query = """
+    query MontrealOfferDefinition($type: String!) {
+      metaobjectDefinitionByType(type: $type) { id type }
+    }
+    """
+    existing = execute_shopify_graphql(
+        lookup_query,
+        {"type": MONTREAL_OFFER_METAOBJECT_TYPE}
+    ).get("metaobjectDefinitionByType")
+    if existing:
+        return existing["id"]
+
+    create_mutation = """
+    mutation CreateMontrealOfferDefinition($definition: MetaobjectDefinitionCreateInput!) {
+      metaobjectDefinitionCreate(definition: $definition) {
+        metaobjectDefinition { id type }
+        userErrors { field message code }
+      }
+    }
+    """
+    definition = {
+        "name": "Montréal offer request",
+        "type": MONTREAL_OFFER_METAOBJECT_TYPE,
+        "description": "Leads submitted through the Montréal offer form on product pages.",
+        "displayNameKey": "name",
+        "fieldDefinitions": [
+            {"name": "Name", "key": "name", "type": "single_line_text_field", "required": True},
+            {"name": "Phone", "key": "phone", "type": "single_line_text_field", "required": True},
+            {"name": "Venue name", "key": "venue", "type": "single_line_text_field", "required": True}
+        ]
+    }
+    created = execute_shopify_graphql(
+        create_mutation,
+        {"definition": definition}
+    ).get("metaobjectDefinitionCreate") or {}
+    user_errors = created.get("userErrors") or []
+    if user_errors:
+        repeated_lookup = execute_shopify_graphql(
+            lookup_query,
+            {"type": MONTREAL_OFFER_METAOBJECT_TYPE}
+        ).get("metaobjectDefinitionByType")
+        if repeated_lookup:
+            return repeated_lookup["id"]
+        raise ValueError(f"Montréal offer definition errors: {user_errors}")
+    metaobject_definition = created.get("metaobjectDefinition")
+    if not metaobject_definition:
+        raise RuntimeError("Shopify did not return the Montréal offer definition.")
+    return metaobject_definition["id"]
+
+
+def create_montreal_offer_metaobject(payload):
+    ensure_montreal_offer_definition()
+    mutation = """
+    mutation CreateMontrealOffer($metaobject: MetaobjectCreateInput!) {
+      metaobjectCreate(metaobject: $metaobject) {
+        metaobject { id handle displayName }
+        userErrors { field message code }
+      }
+    }
+    """
+    result = execute_shopify_graphql(
+        mutation,
+        {
+            "metaobject": {
+                "type": MONTREAL_OFFER_METAOBJECT_TYPE,
+                "handle": f"montreal-offer-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}",
+                "fields": [
+                    {"key": "name", "value": payload["name"]},
+                    {"key": "phone", "value": payload["phone"]},
+                    {"key": "venue", "value": payload["venue"]}
+                ]
+            }
+        }
+    ).get("metaobjectCreate") or {}
+    user_errors = result.get("userErrors") or []
+    if user_errors:
+        raise ValueError(f"Montréal offer create errors: {user_errors}")
+    metaobject = result.get("metaobject")
+    if not metaobject:
+        raise RuntimeError("Shopify did not return the Montréal offer request.")
     return metaobject
 
 
@@ -1250,6 +1338,50 @@ def create_draft_order():
             'success': False,
             'message': f'Server error: {str(e)}'
         }), 500
+    finally:
+        shopify.ShopifyResource.clear_session()
+
+
+@app.route('/api/montreal-offer', methods=['POST', 'OPTIONS'])
+def create_montreal_offer():
+    """Save a Montréal lead as a Metaobject; Shopify Flow sends the email."""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        data = request.get_json(silent=True) or {}
+        name = str(data.get('name') or '').strip()[:100]
+        phone = str(data.get('phone') or '').strip()[:30]
+        venue = str(data.get('venue') or '').strip()[:150]
+
+        phone_digits = re.sub(r'\D', '', phone)
+        if not name or len(phone_digits) < 10 or not venue:
+            return jsonify({
+                'success': False,
+                'message': 'Name, valid phone number and venue are required.'
+            }), 400
+
+        request_shop = data.get('shop') or request.args.get('shop') or SHOP_URL
+        if not request_shop:
+            return jsonify({'success': False, 'message': 'Shop is not configured.'}), 500
+        activate_shop_session(request_shop)
+        metaobject = create_montreal_offer_metaobject({
+            'name': name,
+            'phone': phone,
+            'venue': venue
+        })
+        logger.info(
+            f"✅ Montréal offer saved for Flow: name={mask_text(name)}, "
+            f"phone={mask_phone(phone)}, venue={mask_text(venue)}"
+        )
+        return jsonify({
+            'success': True,
+            'message': 'Offer request saved.',
+            'metaobject_id': metaobject['id']
+        }), 201
+    except Exception as e:
+        logger.exception("❌ Error in /api/montreal-offer")
+        return jsonify({'success': False, 'message': 'Could not save offer request.'}), 500
     finally:
         shopify.ShopifyResource.clear_session()
 

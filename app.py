@@ -83,6 +83,7 @@ EXIT_SURVEY_RATE_LIMIT = int(os.getenv("EXIT_SURVEY_RATE_LIMIT", "20"))
 EXIT_SURVEY_RATE_WINDOW_SECONDS = int(os.getenv("EXIT_SURVEY_RATE_WINDOW_SECONDS", "3600"))
 EXIT_SURVEY_REQUESTS = {}
 COMPETITOR_CRON_SECRET = os.getenv("COMPETITOR_CRON_SECRET", "")
+MONTREAL_OFFERS_API_SECRET = os.getenv("MONTREAL_OFFERS_API_SECRET", "")
 COMPETITOR_TAG = "competitor-price-compare"
 COMPETITOR_NAMESPACE = "price_comparison"
 COMPETITOR_TIMEOUT_SECONDS = int(os.getenv("COMPETITOR_TIMEOUT_SECONDS", "15"))
@@ -729,6 +730,17 @@ def competitor_request_is_authorized():
     if authorization.startswith("Bearer "):
         supplied = authorization[7:]
     return hmac.compare_digest(str(supplied), COMPETITOR_CRON_SECRET)
+
+
+def montreal_offers_request_is_authorized():
+    """Authorize server-to-server access to the Montréal leads feed."""
+    if not MONTREAL_OFFERS_API_SECRET:
+        return False
+    authorization = request.headers.get("Authorization", "")
+    if not authorization.startswith("Bearer "):
+        return False
+    supplied = authorization[7:].strip()
+    return hmac.compare_digest(supplied, MONTREAL_OFFERS_API_SECRET)
 
 
 def ensure_competitor_metafield_definitions():
@@ -1458,6 +1470,87 @@ def create_montreal_offer():
         shopify.ShopifyResource.clear_session()
 
 
+@app.route('/api/montreal-offers', methods=['GET'])
+def list_montreal_offers():
+    """Return the current Montréal lead list from Shopify Metaobjects."""
+    if not montreal_offers_request_is_authorized():
+        response = jsonify({'success': False, 'message': 'Unauthorized'})
+        response.headers['WWW-Authenticate'] = 'Bearer'
+        return response, 401
+
+    query = """
+    query MontrealOffers($type: String!, $after: String) {
+      metaobjects(
+        type: $type,
+        first: 100,
+        after: $after,
+        sortKey: "updated_at",
+        reverse: true
+      ) {
+        nodes {
+          id
+          handle
+          updatedAt
+          fields { key value }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+    """
+
+    try:
+        activate_shop_session(SHOP_URL)
+        offers = []
+        cursor = None
+
+        while True:
+            connection = execute_shopify_graphql(
+                query,
+                {
+                    'type': MONTREAL_OFFER_METAOBJECT_TYPE,
+                    'after': cursor
+                }
+            ).get('metaobjects') or {}
+
+            for node in connection.get('nodes') or []:
+                fields = {
+                    field.get('key'): field.get('value')
+                    for field in (node.get('fields') or [])
+                }
+                offers.append({
+                    'id': node.get('id'),
+                    'handle': node.get('handle'),
+                    'name': fields.get('name', ''),
+                    'phone': fields.get('phone', ''),
+                    'venue': fields.get('venue', ''),
+                    'page_url': fields.get('page_url', ''),
+                    'updated_at': node.get('updatedAt')
+                })
+
+            page_info = connection.get('pageInfo') or {}
+            if not page_info.get('hasNextPage'):
+                break
+            cursor = page_info.get('endCursor')
+            if not cursor:
+                break
+
+        response = jsonify({
+            'success': True,
+            'count': len(offers),
+            'offers': offers
+        })
+        response.headers['Cache-Control'] = 'no-store, private'
+        return response, 200
+    except Exception:
+        logger.exception("❌ Error in GET /api/montreal-offers")
+        return jsonify({
+            'success': False,
+            'message': 'Could not load Montréal offers.'
+        }), 500
+    finally:
+        shopify.ShopifyResource.clear_session()
+
+
 @app.route('/api/exit-survey', methods=['POST', 'OPTIONS'])
 def create_exit_survey():
     """Store an anonymous exit-intent survey response as a Shopify Metaobject."""
@@ -1701,6 +1794,8 @@ if __name__ == '__main__':
     logger.info(f"🔌 Порт: {PORT}")
     logger.info(f"🔗 Endpoints:")
     logger.info(f"   - POST http://localhost:{PORT}/api/create-draft")
+    logger.info(f"   - POST http://localhost:{PORT}/api/montreal-offer")
+    logger.info(f"   - GET  http://localhost:{PORT}/api/montreal-offers")
     logger.info(f"   - POST http://localhost:{PORT}/api/exit-survey")
     logger.info(f"   - POST http://localhost:{PORT}/api/competitor-prices/setup")
     logger.info(f"   - POST http://localhost:{PORT}/api/competitor-prices/refresh")

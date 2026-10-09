@@ -555,7 +555,11 @@ def ensure_montreal_offer_definition():
     """Create the Metaobject definition used by the Montréal lead Shopify Flow."""
     lookup_query = """
     query MontrealOfferDefinition($type: String!) {
-      metaobjectDefinitionByType(type: $type) { id type }
+      metaobjectDefinitionByType(type: $type) {
+        id
+        type
+        fieldDefinitions { key }
+      }
     }
     """
     existing = execute_shopify_graphql(
@@ -563,6 +567,42 @@ def ensure_montreal_offer_definition():
         {"type": MONTREAL_OFFER_METAOBJECT_TYPE}
     ).get("metaobjectDefinitionByType")
     if existing:
+        existing_keys = {
+            field.get("key")
+            for field in (existing.get("fieldDefinitions") or [])
+        }
+        if "page_url" not in existing_keys:
+            update_mutation = """
+            mutation UpdateMontrealOfferDefinition(
+              $id: ID!,
+              $definition: MetaobjectDefinitionUpdateInput!
+            ) {
+              metaobjectDefinitionUpdate(id: $id, definition: $definition) {
+                metaobjectDefinition { id type }
+                userErrors { field message code }
+              }
+            }
+            """
+            updated = execute_shopify_graphql(
+                update_mutation,
+                {
+                    "id": existing["id"],
+                    "definition": {
+                        "fieldDefinitions": [
+                            {
+                                "create": {
+                                    "name": "Page URL",
+                                    "key": "page_url",
+                                    "type": "url"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ).get("metaobjectDefinitionUpdate") or {}
+            user_errors = updated.get("userErrors") or []
+            if user_errors:
+                raise ValueError(f"Montréal offer definition update errors: {user_errors}")
         return existing["id"]
 
     create_mutation = """
@@ -581,7 +621,8 @@ def ensure_montreal_offer_definition():
         "fieldDefinitions": [
             {"name": "Name", "key": "name", "type": "single_line_text_field", "required": True},
             {"name": "Phone", "key": "phone", "type": "single_line_text_field", "required": True},
-            {"name": "Venue name", "key": "venue", "type": "single_line_text_field", "required": True}
+            {"name": "Venue name", "key": "venue", "type": "single_line_text_field", "required": True},
+            {"name": "Page URL", "key": "page_url", "type": "url", "required": True}
         ]
     }
     created = execute_shopify_graphql(
@@ -613,17 +654,20 @@ def create_montreal_offer_metaobject(payload):
       }
     }
     """
+    fields = [
+        {"key": "name", "value": payload["name"]},
+        {"key": "phone", "value": payload["phone"]},
+        {"key": "venue", "value": payload["venue"]},
+        {"key": "page_url", "value": payload["page_url"]}
+    ]
+
     result = execute_shopify_graphql(
         mutation,
         {
             "metaobject": {
                 "type": MONTREAL_OFFER_METAOBJECT_TYPE,
                 "handle": f"montreal-offer-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}",
-                "fields": [
-                    {"key": "name", "value": payload["name"]},
-                    {"key": "phone", "value": payload["phone"]},
-                    {"key": "venue", "value": payload["venue"]}
-                ]
+                "fields": fields
             }
         }
     ).get("metaobjectCreate") or {}
@@ -1353,13 +1397,40 @@ def create_montreal_offer():
         name = str(data.get('name') or '').strip()[:100]
         phone = str(data.get('phone') or '').strip()[:30]
         venue = str(data.get('venue') or '').strip()[:150]
+        page_url = str(data.get('page_url') or '').strip()[:1000]
 
-        phone_digits = re.sub(r'\D', '', phone)
-        if not name or len(phone_digits) < 10 or not venue:
+        parsed_page_url = urlparse(page_url)
+        page_hostname = (parsed_page_url.hostname or '').lower()
+        production_hosts = {
+            'mixopro.store',
+            'www.mixopro.store',
+            '6b3e9b-4.myshopify.com'
+        }
+        local_hosts = {'127.0.0.1', 'localhost'}
+        valid_page_url = (
+            parsed_page_url.scheme == 'https' and page_hostname in production_hosts
+        ) or (
+            parsed_page_url.scheme in {'http', 'https'} and page_hostname in local_hosts
+        )
+        if not valid_page_url:
             return jsonify({
                 'success': False,
-                'message': 'Name, valid phone number and venue are required.'
+                'message': 'A valid MIXOpro page URL is required.'
             }), 400
+
+        # Fragments are browser-only and aren't useful in the stored attribution URL.
+        page_url = urlunparse(parsed_page_url._replace(fragment=''))
+
+        phone_digits = re.sub(r'\D', '', phone)
+        if len(phone_digits) == 11 and phone_digits.startswith('1'):
+            phone_digits = phone_digits[1:]
+        if not name or not venue or not re.fullmatch(r'[2-9]\d{2}[2-9]\d{6}', phone_digits):
+            return jsonify({
+                'success': False,
+                'message': 'Name, venue name, and a valid 10-digit Canadian phone number are required.'
+            }), 400
+
+        phone = f'+1 ({phone_digits[:3]}) {phone_digits[3:6]}-{phone_digits[6:]}'
 
         request_shop = data.get('shop') or request.args.get('shop') or SHOP_URL
         if not request_shop:
@@ -1368,11 +1439,12 @@ def create_montreal_offer():
         metaobject = create_montreal_offer_metaobject({
             'name': name,
             'phone': phone,
-            'venue': venue
+            'venue': venue,
+            'page_url': page_url
         })
         logger.info(
             f"✅ Montréal offer saved for Flow: name={mask_text(name)}, "
-            f"phone={mask_phone(phone)}, venue={mask_text(venue)}"
+            f"phone={mask_phone(phone)}, venue={mask_text(venue)}, page={page_url}"
         )
         return jsonify({
             'success': True,

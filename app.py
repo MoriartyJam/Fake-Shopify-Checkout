@@ -572,7 +572,24 @@ def ensure_montreal_offer_definition():
             field.get("key")
             for field in (existing.get("fieldDefinitions") or [])
         }
+        missing_fields = []
         if "page_url" not in existing_keys:
+            missing_fields.append({
+                "create": {
+                    "name": "Page URL",
+                    "key": "page_url",
+                    "type": "url"
+                }
+            })
+        if "lang" not in existing_keys:
+            missing_fields.append({
+                "create": {
+                    "name": "Language",
+                    "key": "lang",
+                    "type": "single_line_text_field"
+                }
+            })
+        if missing_fields:
             update_mutation = """
             mutation UpdateMontrealOfferDefinition(
               $id: ID!,
@@ -589,15 +606,7 @@ def ensure_montreal_offer_definition():
                 {
                     "id": existing["id"],
                     "definition": {
-                        "fieldDefinitions": [
-                            {
-                                "create": {
-                                    "name": "Page URL",
-                                    "key": "page_url",
-                                    "type": "url"
-                                }
-                            }
-                        ]
+                        "fieldDefinitions": missing_fields
                     }
                 }
             ).get("metaobjectDefinitionUpdate") or {}
@@ -623,7 +632,8 @@ def ensure_montreal_offer_definition():
             {"name": "Name", "key": "name", "type": "single_line_text_field", "required": True},
             {"name": "Phone", "key": "phone", "type": "single_line_text_field", "required": True},
             {"name": "Venue name", "key": "venue", "type": "single_line_text_field", "required": True},
-            {"name": "Page URL", "key": "page_url", "type": "url", "required": True}
+            {"name": "Page URL", "key": "page_url", "type": "url", "required": True},
+            {"name": "Language", "key": "lang", "type": "single_line_text_field", "required": True}
         ]
     }
     created = execute_shopify_graphql(
@@ -659,7 +669,8 @@ def create_montreal_offer_metaobject(payload):
         {"key": "name", "value": payload["name"]},
         {"key": "phone", "value": payload["phone"]},
         {"key": "venue", "value": payload["venue"]},
-        {"key": "page_url", "value": payload["page_url"]}
+        {"key": "page_url", "value": payload["page_url"]},
+        {"key": "lang", "value": payload["lang"]}
     ]
 
     result = execute_shopify_graphql(
@@ -1432,6 +1443,10 @@ def create_montreal_offer():
 
         # Fragments are browser-only and aren't useful in the stored attribution URL.
         page_url = urlunparse(parsed_page_url._replace(fragment=''))
+        lang = str(data.get('lang') or '').strip().lower().split('-', 1)[0]
+        if lang not in {'en', 'fr'}:
+            path_language = parsed_page_url.path.strip('/').split('/', 1)[0].lower()
+            lang = 'fr' if path_language == 'fr' else 'en'
 
         phone_digits = re.sub(r'\D', '', phone)
         if len(phone_digits) == 11 and phone_digits.startswith('1'):
@@ -1452,11 +1467,13 @@ def create_montreal_offer():
             'name': name,
             'phone': phone,
             'venue': venue,
-            'page_url': page_url
+            'page_url': page_url,
+            'lang': lang
         })
         logger.info(
             f"✅ Montréal offer saved for Flow: name={mask_text(name)}, "
-            f"phone={mask_phone(phone)}, venue={mask_text(venue)}, page={page_url}"
+            f"phone={mask_phone(phone)}, venue={mask_text(venue)}, "
+            f"lang={lang}, page={page_url}"
         )
         return jsonify({
             'success': True,
@@ -1517,14 +1534,19 @@ def list_montreal_offers():
                     field.get('key'): field.get('value')
                     for field in (node.get('fields') or [])
                 }
+                offer_lang = str(fields.get('lang') or '').lower()
+                if offer_lang not in {'en', 'fr'}:
+                    offer_path = urlparse(fields.get('page_url') or '').path
+                    offer_lang = 'fr' if offer_path.strip('/').split('/', 1)[0].lower() == 'fr' else 'en'
                 offers.append({
-                    'id': node.get('id'),
                     'handle': node.get('handle'),
+                    'id': node.get('id'),
                     'name': fields.get('name', ''),
                     'phone': fields.get('phone', ''),
                     'venue': fields.get('venue', ''),
                     'page_url': fields.get('page_url', ''),
-                    'updated_at': node.get('updatedAt')
+                    'updated_at': node.get('updatedAt'),
+                    'lang': offer_lang
                 })
 
             page_info = connection.get('pageInfo') or {}
@@ -1809,3 +1831,4 @@ if __name__ == '__main__':
         port=PORT,
         debug=True
     )
+

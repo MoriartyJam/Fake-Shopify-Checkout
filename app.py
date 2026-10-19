@@ -7,6 +7,7 @@ import hashlib
 import base64
 import sqlite3
 import re
+import time
 from collections import deque
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -84,6 +85,14 @@ EXIT_SURVEY_RATE_WINDOW_SECONDS = int(os.getenv("EXIT_SURVEY_RATE_WINDOW_SECONDS
 EXIT_SURVEY_REQUESTS = {}
 COMPETITOR_CRON_SECRET = os.getenv("COMPETITOR_CRON_SECRET", "")
 MONTREAL_OFFERS_API_SECRET = os.getenv("MONTREAL_OFFERS_API_SECRET", "")
+MONTREAL_OFFER_WEBHOOK_URL = os.getenv(
+    "MONTREAL_OFFER_WEBHOOK_URL",
+    "https://jared.mixopro.store/webhooks/site/offer"
+)
+SITE_WEBHOOK_SECRET = os.getenv("SITE_WEBHOOK_SECRET", "")
+MONTREAL_OFFER_WEBHOOK_RETRY_DELAY_SECONDS = float(
+    os.getenv("MONTREAL_OFFER_WEBHOOK_RETRY_DELAY_SECONDS", "1")
+)
 COMPETITOR_TAG = "competitor-price-compare"
 COMPETITOR_NAMESPACE = "price_comparison"
 COMPETITOR_TIMEOUT_SECONDS = int(os.getenv("COMPETITOR_TIMEOUT_SECONDS", "15"))
@@ -660,7 +669,7 @@ def create_montreal_offer_metaobject(payload):
     mutation = """
     mutation CreateMontrealOffer($metaobject: MetaobjectCreateInput!) {
       metaobjectCreate(metaobject: $metaobject) {
-        metaobject { id handle displayName }
+        metaobject { id handle displayName updatedAt }
         userErrors { field message code }
       }
     }
@@ -690,6 +699,58 @@ def create_montreal_offer_metaobject(payload):
     if not metaobject:
         raise RuntimeError("Shopify did not return the Montréal offer request.")
     return metaobject
+
+
+def forward_montreal_offer(payload):
+    """Forward one normalized Montréal offer to Jared using the shared site secret."""
+    if not SITE_WEBHOOK_SECRET:
+        logger.error(
+            "❌ Montréal offer webhook was not sent: SITE_WEBHOOK_SECRET is not configured."
+        )
+        return False
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Site-Secret": SITE_WEBHOOK_SECRET
+    }
+    for attempt in range(1, 3):
+        try:
+            response = requests.post(
+                MONTREAL_OFFER_WEBHOOK_URL,
+                json=payload,
+                headers=headers,
+                timeout=15
+            )
+            if 200 <= response.status_code < 300:
+                logger.info(
+                    "✅ Montréal offer webhook delivered: handle=%s, attempt=%s",
+                    payload.get("handle"),
+                    attempt
+                )
+                return True
+
+            logger.warning(
+                "⚠️ Montréal offer webhook returned HTTP %s: handle=%s, attempt=%s",
+                response.status_code,
+                payload.get("handle"),
+                attempt
+            )
+        except requests.RequestException as error:
+            logger.warning(
+                "⚠️ Montréal offer webhook request failed: handle=%s, attempt=%s, error=%s",
+                payload.get("handle"),
+                attempt,
+                error
+            )
+
+        if attempt == 1:
+            time.sleep(MONTREAL_OFFER_WEBHOOK_RETRY_DELAY_SECONDS)
+
+    logger.error(
+        "❌ Montréal offer webhook delivery failed after 2 attempts: handle=%s",
+        payload.get("handle")
+    )
+    return False
 
 
 def exit_survey_rate_limited():
@@ -1411,7 +1472,7 @@ def create_draft_order():
 
 @app.route('/api/montreal-offer', methods=['POST', 'OPTIONS'])
 def create_montreal_offer():
-    """Save a Montréal lead as a Metaobject; Shopify Flow sends the email."""
+    """Save a Montréal lead as a Metaobject and forward it to Jared."""
     if request.method == 'OPTIONS':
         return '', 204
 
@@ -1470,15 +1531,27 @@ def create_montreal_offer():
             'page_url': page_url,
             'lang': lang
         })
+        webhook_payload = {
+            'handle': metaobject['handle'],
+            'id': metaobject['id'],
+            'name': name,
+            'phone': phone,
+            'venue': venue,
+            'page_url': page_url,
+            'updated_at': metaobject.get('updatedAt') or datetime.now(timezone.utc).isoformat(),
+            'lang': lang
+        }
+        webhook_delivered = forward_montreal_offer(webhook_payload)
         logger.info(
-            f"✅ Montréal offer saved for Flow: name={mask_text(name)}, "
+            f"✅ Montréal offer saved: name={mask_text(name)}, "
             f"phone={mask_phone(phone)}, venue={mask_text(venue)}, "
-            f"lang={lang}, page={page_url}"
+            f"lang={lang}, page={page_url}, webhook_delivered={webhook_delivered}"
         )
         return jsonify({
             'success': True,
             'message': 'Offer request saved.',
-            'metaobject_id': metaobject['id']
+            'metaobject_id': metaobject['id'],
+            'webhook_delivered': webhook_delivered
         }), 201
     except Exception as e:
         logger.exception("❌ Error in /api/montreal-offer")
